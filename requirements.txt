@@ -51,7 +51,7 @@ requests==2.32.3           # Standard HTTP client — used for simpler one-off A
 # Example: "vaccines cause autism" matches "autism linked to vaccination"
 # -----------------------------------------------------------------------------
 sentence-transformers==3.3.1  # AI model that converts text into 384-number vectors
-torch==2.5.1                  # PyTorch — the AI engine that sentence-transformers runs on
+# torch==2.5.1                 PyTorch — the AI engine that sentence-transformers runs on
 numpy==1.26.4                 # Math library used by the AI models for number crunching
 
 
