@@ -1,0 +1,35 @@
+# ============================================================
+# render.yaml — Tells Render.com how to deploy the backend
+# ============================================================
+# When you connect your GitHub repo to Render, it reads this file
+# automatically and configures everything for you.
+# ============================================================
+
+services:
+  - type: web
+    name: credibility-platform-api
+    runtime: python
+    rootDir: .                           # All files are at the repo root
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: free                           # Free tier — upgrade when you scale
+    healthCheckPath: /health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: SUPABASE_URL
+        sync: false                      # Set manually in Render dashboard
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+      - key: NEWSAPI_KEY
+        sync: false
+      - key: GNEWS_KEY
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true             # Render auto-generates a random value
+      - key: ALLOWED_ORIGINS_STR
+        sync: false                     # Set to your Vercel URL in dashboard
