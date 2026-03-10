@@ -11,7 +11,7 @@ uvicorn[standard]==0.32.1  # The server that runs FastAPI
 
 # ── Supabase (database + auth) ────────────────────────────────
 supabase==2.10.0           # Official Supabase Python client
-gotrue==2.9.0              # Supabase Auth library (installed by supabase)
+gotrue==2.10.0              # Supabase Auth library (installed by supabase)
 
 # ── JWT (token verification) ──────────────────────────────────
 PyJWT==2.10.1              # Decode and verify Supabase JWTs
