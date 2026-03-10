@@ -2,66 +2,43 @@
 # requirements.txt — Python dependencies for Credibility AI Platform Backend
 # =============================================================================
 
-
 # -----------------------------------------------------------------------------
 # WEB FRAMEWORK
-# The core engine that runs the API server and handles all HTTP requests
 # -----------------------------------------------------------------------------
-fastapi==0.115.5           # Main API framework — handles all routes, requests, responses
-uvicorn[standard]==0.32.1  # Web server that runs FastAPI (like Apache but for Python)
-
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
 
 # -----------------------------------------------------------------------------
 # SUPABASE — Database & Authentication
-# Only the main package is pinned — sub-packages are resolved automatically
-# Manually pinning gotrue, postgrest, httpx etc. causes version conflicts
 # -----------------------------------------------------------------------------
-supabase==2.10.0           # Main Supabase client — connects to your PostgreSQL database
-
+supabase==2.10.0
 
 # -----------------------------------------------------------------------------
 # AUTHENTICATION
-# Used to verify that incoming requests are from real logged-in users
 # -----------------------------------------------------------------------------
-PyJWT==2.10.1              # Reads and verifies the JWT tokens sent by Supabase after login
-cryptography==43.0.3       # Provides the encryption algorithms that PyJWT needs to work
-
+PyJWT==2.10.1
+cryptography==43.0.3
 
 # -----------------------------------------------------------------------------
 # DATA VALIDATION
-# Ensures all incoming API requests have the correct format before processing
 # -----------------------------------------------------------------------------
-pydantic==2.10.3           # Validates request/response data shapes (e.g. email must be a string)
-pydantic-settings==2.7.0   # Loads environment variables from .env file into Python settings
-python-dotenv==1.0.1       # Reads the .env file and makes variables available to the app
-
+pydantic==2.10.3
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
 
 # -----------------------------------------------------------------------------
 # HTTP CLIENTS
-# Used to call external APIs (NewsAPI, GNews) to fetch news articles
 # -----------------------------------------------------------------------------
-aiohttp==3.11.10           # Async HTTP client — fetches news from multiple sources in parallel
-requests==2.32.3           # Standard HTTP client — used for simpler one-off API calls
-
-
-# -----------------------------------------------------------------------------
-# AI / EMBEDDINGS
-# Converts claim text into numbers (vectors) so similar claims can be found
-# This is what powers the semantic cache — finding "same claim, different wording"
-# Example: "vaccines cause autism" matches "autism linked to vaccination"
-# -----------------------------------------------------------------------------
-sentence-transformers==3.3.1  # AI model that converts text into 384-number vectors
-# torch==2.5.1                 PyTorch — the AI engine that sentence-transformers runs on
-numpy==1.26.4                 # Math library used by the AI models for number crunching
-
+aiohttp==3.11.10
+requests==2.32.3
 
 # -----------------------------------------------------------------------------
 # NEWS APIs
-# Python wrapper for NewsAPI — makes it easier to search for news articles
-# GNews is called directly via httpx (no wrapper needed)
 # -----------------------------------------------------------------------------
-newsapi-python==0.2.7      # Official NewsAPI client — searches 100+ news sources for claims
-
+newsapi-python==0.2.7
 
 # -----------------------------------------------------------------------------
-# TESTI
+# TESTING
+# -----------------------------------------------------------------------------
+pytest==8.3.4
+pytest-asyncio==0.24.0
