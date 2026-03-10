@@ -1,0 +1,31 @@
+# ============================================================
+# requirements.txt — Python packages for the backend
+# ============================================================
+# Install all at once:
+#   pip install -r requirements.txt
+# ============================================================
+
+# ── Web framework ─────────────────────────────────────────────
+fastapi==0.115.5           # The API framework
+uvicorn[standard]==0.32.1  # The server that runs FastAPI
+
+# ── Supabase (database + auth) ────────────────────────────────
+supabase==2.10.0           # Official Supabase Python client
+gotrue==2.9.0              # Supabase Auth library (installed by supabase)
+
+# ── JWT (token verification) ──────────────────────────────────
+PyJWT==2.10.1              # Decode and verify Supabase JWTs
+cryptography==43.0.3       # Required by PyJWT for some algorithms
+
+# ── HTTP client (for calling news APIs) ──────────────────────
+httpx==0.28.1              # Async HTTP client — faster than requests
+
+# ── Settings / config ─────────────────────────────────────────
+pydantic==2.10.3           # Data validation (used by FastAPI)
+pydantic-settings==2.7.0   # Loads settings from .env file
+python-dotenv==1.0.1       # Reads .env files
+
+# ── Testing ───────────────────────────────────────────────────
+pytest==8.3.4              # Test runner
+pytest-asyncio==0.24.0     # Async test support
+httpx==0.28.1              # Also used for test client
