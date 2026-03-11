@@ -1,9 +1,15 @@
 # =============================================================================
-# app/models/schemas.py  — Request/response shapes (updated with account cred.)
+# app/models/schemas.py  — Request/response shapes
+# =============================================================================
+# FIXES APPLIED:
+#   1. ClaimResult — added optional semantic_match, similarity_score,
+#      matched_claim_text fields for semantic cache transparency
+#   2. VerifyResponse — added optional cache_info and elapsed_ms fields
+#   3. VerifyResponse — field names corrected (claim_results, sources_consulted)
 # =============================================================================
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict, Any
 from datetime import datetime
 
 
@@ -39,11 +45,6 @@ class AccountMetadata(BaseModel):
     """
     Optional account/source info the frontend can send.
     The more fields provided, the better the account credibility analysis.
-
-    For tweets: the frontend can extract username, follower_count, is_verified
-    from the pasted URL or content using Twitter API or Puter.js.
-
-    For articles: the source_url is usually enough to identify the domain.
     """
     username:            Optional[str]  = None
     display_name:        Optional[str]  = None
@@ -59,12 +60,12 @@ class AccountMetadata(BaseModel):
     model_config = {
         "json_schema_extra": {
             "example": {
-                "username":         "@RealUser123",
-                "is_verified":      False,
-                "follower_count":   250,
-                "account_age_days": 45,
+                "username":            "@RealUser123",
+                "is_verified":         False,
+                "follower_count":      250,
+                "account_age_days":    45,
                 "has_profile_picture": True,
-                "has_bio":          False,
+                "has_bio":             False,
             }
         }
     }
@@ -85,18 +86,7 @@ class ClaimInput(BaseModel):
 # ─────────────────────────────────────────────────────────────
 
 class VerifyRequest(BaseModel):
-    """
-    What the frontend sends to POST /verify/
-
-    Required:
-      original_content  — the text being checked
-      claims            — extracted by Puter.js on the frontend
-
-    Optional:
-      source_url        — where the content came from
-      content_type      — tweet | article | post | other
-      account_metadata  — info about the account that posted it
-    """
+    """What the frontend sends to POST /verify/"""
     original_content: str = Field(min_length=10, max_length=10_000)
     claims:           List[ClaimInput] = Field(min_length=1, max_length=20)
     source_url:       Optional[str] = None
@@ -115,9 +105,9 @@ class VerifyRequest(BaseModel):
                 "claims": [{"text": "Scientists confirmed vaccines cause autism"}],
                 "content_type": "tweet",
                 "account_metadata": {
-                    "username": "@BreakingNewsBot123",
-                    "is_verified": False,
-                    "follower_count": 52,
+                    "username":        "@BreakingNewsBot123",
+                    "is_verified":     False,
+                    "follower_count":  52,
                     "account_age_days": 12,
                 }
             }
@@ -145,6 +135,12 @@ class ClaimResult(BaseModel):
     supporting_articles: List[str] = []
     sources_checked:    List[str]  = []
     fact_check_status:  Optional[str] = None
+
+    # ── Semantic cache transparency fields ────────────────────────────────────
+    # Populated when this result came from a semantic (meaning-based) cache hit
+    semantic_match:      bool            = False
+    similarity_score:    Optional[float] = None   # 0.85–1.0 for semantic hits
+    matched_claim_text:  Optional[str]   = None   # the stored claim that matched
 
 
 class SubScoreDetail(BaseModel):
@@ -204,7 +200,13 @@ class VerifyResponse(BaseModel):
     # ── Rate limit info ───────────────────────────────────────────────────────
     usage: Optional[dict] = None   # {used, limit, remaining, plan}
 
-    created_at:         str
+    # ── Cache info (semantic search transparency) ─────────────────────────────
+    cache_info: Optional[dict] = None  # {hits, misses, exact_hits, semantic_hits, ...}
+
+    # ── Performance ───────────────────────────────────────────────────────────
+    elapsed_ms: Optional[int] = None
+
+    created_at: str
 
 
 # ─────────────────────────────────────────────────────────────
