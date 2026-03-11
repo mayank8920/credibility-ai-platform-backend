@@ -55,37 +55,4 @@ async def login(payload: LoginRequest):
 ```
 
 ---
-
-## After Both Fixes — Your Final Structure Should Be
-```
-credibility-backend/
-├── main.py                ← ROOT level (not inside app/)
-├── requirements.txt
-├── Dockerfile
-├── app/
-│   ├── __init__.py
-│   ├── config.py
-│   ├── models/
-│   │   ├── __init__.py
-│   │   └── schemas.py
-│   ├── routes/
-│   │   ├── __init__.py
-│   │   ├── auth.py        ← just created
-│   │   ├── verify.py
-│   │   ├── history.py
-│   │   ├── user.py
-│   │   ├── usage.py
-│   │   └── claims.py
-│   ├── middleware/
-│   │   ├── __init__.py
-│   │   └── auth.py        ← JWT verification (already exists)
-│   └── services/
-│       ├── __init__.py
-│       ├── database.py
-│       ├── news_service.py
-│       ├── scoring_engine.py
-│       ├── claim_cache.py
-│       ├── embedding_service.py
-│       ├── account_credibility.py
-│       ├── usage_service.py
 │       └── supabase_service.py
