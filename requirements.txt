@@ -28,9 +28,12 @@ python-dotenv==1.0.1
 
 # -----------------------------------------------------------------------------
 # HTTP CLIENTS
+# httpx is used by both news_service.py AND embedding_service.py (Jina API)
+# No extra packages needed — Jina embeddings work over plain HTTPS with httpx
 # -----------------------------------------------------------------------------
 aiohttp==3.11.10
 requests==2.32.3
+httpx==0.27.0
 
 # -----------------------------------------------------------------------------
 # NEWS APIs
@@ -42,3 +45,15 @@ newsapi-python==0.2.7
 # -----------------------------------------------------------------------------
 pytest==8.3.4
 pytest-asyncio==0.24.0
+
+# -----------------------------------------------------------------------------
+# REMOVED packages (and why):
+#
+#   sentence-transformers  → caused ~8GB Docker image (local model download)
+#   numpy                  → was only needed by sentence-transformers
+#   openai                 → replaced with Jina AI free tier (no cost)
+#
+# Embeddings now use Jina AI REST API via httpx (already listed above).
+# Set JINA_API_KEY in .env to enable semantic search.
+# If not set, exact hash matching is used and everything still works.
+# -----------------------------------------------------------------------------
