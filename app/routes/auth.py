@@ -55,4 +55,3 @@ async def login(payload: LoginRequest):
 ```
 
 ---
-│       └── supabase_service.py
