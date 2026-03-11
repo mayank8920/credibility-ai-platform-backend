@@ -52,6 +52,3 @@ async def login(payload: LoginRequest):
             status_code = status.HTTP_401_UNAUTHORIZED,
             detail      = "Invalid email or password.",
         )
-```
-
----
