@@ -11,87 +11,80 @@
 #   user_id: str = Depends(get_verified_user_id)
 # =============================================================================
 
+# =============================================================================
+# app/middleware/auth.py — Supabase token verification (PRODUCTION SAFE)
+# =============================================================================
+
+import httpx
 import logging
-import jwt
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# HTTPBearer extracts the token from the "Authorization: Bearer <token>" header
 _bearer = HTTPBearer(auto_error=True)
+
+SUPABASE_USER_URL = f"{settings.SUPABASE_URL}/auth/v1/user"
 
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(_bearer),
 ) -> dict:
     """
-    FastAPI dependency — verifies the Supabase JWT and returns the decoded payload.
+    Production-safe Supabase authentication.
 
-    The payload contains: sub (user UUID), email, role, exp, iat, etc.
+    Instead of manually decoding JWT (which breaks with RS256 / JWK),
+    we ask Supabase Auth server to validate the token.
 
-    Raises HTTP 401 if:
-      • No Authorization header is present
-      • The token is malformed
-      • The token has expired
-      • The signature is invalid
+    If token is valid → returns user JSON
+    If invalid / expired → returns 401
     """
+
     token = credentials.credentials
 
-    if not settings.SUPABASE_JWT_SECRET:
-        # If secret isn't configured yet, warn loudly but don't crash the whole app
-        logger.error(
-            "SUPABASE_JWT_SECRET is not set in .env — "
-            "all authenticated endpoints will return 401."
-        )
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(
+                SUPABASE_USER_URL,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": settings.SUPABASE_ANON_KEY,
+                },
+            )
+
+        if response.status_code != 200:
+            logger.warning(
+                f"[Auth] Supabase rejected token. Status={response.status_code}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired session",
+            )
+
+        return response.json()
+
+    except httpx.RequestError as exc:
+        logger.error(f"[Auth] Supabase auth request failed: {exc}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Authentication service is not configured. Contact support.",
-        )
-
-    try:
-        payload = jwt.decode(
-            token,
-            settings.SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            options={"verify_aud": False},   # Supabase JWTs don't always include aud
-        )
-        return payload
-
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Your session has expired. Please log in again.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    except jwt.InvalidTokenError as exc:
-        logger.warning(f"[Auth] Invalid JWT: {exc}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    except Exception as exc:
-        logger.error(f"[Auth] Unexpected error during JWT decode: {exc}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication failed.",
+            detail="Authentication service unavailable",
         )
 
 
 async def get_verified_user_id(
     current_user: dict = Depends(get_current_user),
 ) -> str:
-    """
-    Convenience dependency — returns just the user's UUID string.
+    user_id = current_user.get("id")
 
-    Use this in routes that only need the user_id, not the full JWT payload.
-    """
-    user_id = current_user.get("sub")
     if not user_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User ID (sub) not found in JWT payload.",
+            detail="User ID not found in Supabase response",
+        )
+
+    return user_idJWT payload.",
         )
     return user_id
