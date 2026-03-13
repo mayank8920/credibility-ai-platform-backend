@@ -1,28 +1,31 @@
 # =============================================================================
-# app/routes/verify.py — POST /verify  (Fixed version)
+# app/routes/verify.py — POST /verify/
 # =============================================================================
 #
-# BUGS FIXED IN THIS VERSION:
-#   1.  AccountInput() called with non-existent fields (original_content, claims)
-#       → replaced with correct fields from account_metadata payload
-#   2.  blend_scores() called with wrong param name (account_weight → weight)
-#       and tried to unpack single float return as a tuple
-#       → fixed to handle single float return correctly
-#   3.  content_result.final_score doesn't exist → content_result.credibility_score
-#   4.  account_result.overall_score doesn't exist → account_result.account_credibility_score
-#   5.  account_result.model_dump() doesn't exist (dataclass, not Pydantic)
-#       → replaced with explicit field mapping
-#   6.  ScoringInput passed sources_checked= which doesn't exist in the dataclass
-#       → replaced with credible_source_count= and total_source_count=
-#   7.  EngineClaimInput passed evidence_summary= which doesn't exist in ClaimInput
-#       → removed that field
-#   8.  SubScoreDetail(**s) where s is a dataclass, not a dict
-#       → uses dataclasses.asdict(s)
-#   9.  VerifyResponse used wrong field name: claims → claim_results
-#   10. VerifyResponse used wrong field name: sources_checked → sources_consulted
-#   11. VerifyResponse missing required fields: penalty_total, created_at
-#   12. _confidence_level() accessed content_result.confidence (doesn't exist)
-#       → uses content_result.confidence_level directly from ScoringResult
+# FIXES APPLIED IN THIS VERSION:
+#
+#   F-03  VerificationHistoryService.save() was missing 9 required NOT NULL
+#         columns → every save threw a Postgres constraint violation → 500.
+#         FIX: replaced usage_service.verification_history with
+#              database.verifications_db which has a complete save() method.
+#
+#   F-04  _evaluate_claim() returned VERIFIED for ANY tier-1 hit regardless
+#         of what the article actually said (e.g. "Vaccines cause autism" →
+#         BBC article debunking it → VERIFIED). Scoring engine's FALSE and
+#         DISPUTED penalties were never triggered.
+#         FIX: Added headline contradiction detection. Titles containing
+#              debunk/false/myth/disprove signals alongside claim keywords
+#              now return DISPUTED or FALSE instead of VERIFIED.
+#
+#   F-08  require_quota (rate_limit.py) was never used in this route.
+#         usage_tracker.check_and_increment() ran a parallel counter in
+#         usage_tracking while the middleware read from usage_limits → two
+#         diverging counters, UI always showed 0.
+#         FIX: removed the inline usage_tracker call entirely.
+#              Added _rate_check: None = Depends(require_quota) dependency
+#              which consolidates rate limiting through rate_limit.py →
+#              usage_limits table → get_usage_status() RPC.
+#              usage_tracker is still imported for the /usage/today response.
 # =============================================================================
 
 import dataclasses
@@ -50,9 +53,18 @@ from app.services.account_credibility import (
     blend_scores,
 )
 from app.services.news_service import search_multiple_claims
-from app.services.usage_service import usage_tracker, verification_history
+
+# F-03 FIX: import verifications_db from database.py (has all required columns)
+# Remove: from app.services.usage_service import usage_tracker, verification_history
+from app.services.database import verifications_db
+from app.services.usage_service import usage_tracker   # kept for usage info in response
+
 from app.services.claim_cache import claim_cache, CachedClaimResult
 from app.middleware.auth import get_current_user
+
+# F-08 FIX: import require_quota so rate limiting uses the consolidated path
+from app.middleware.rate_limit import require_quota
+
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -67,6 +79,23 @@ _TIER1_DOMAINS = {
     "who.int", "cdc.gov", "nasa.gov", "nih.gov",
 }
 
+# F-04: Keywords in article headlines that signal a claim is being CONTRADICTED
+_CONTRADICTION_SIGNALS = [
+    "debunked", "debunks", "false", "not true", "no evidence",
+    "misleading", "misinformation", "disproved", "disproves",
+    "myth", "hoax", "fake", "fabricated", "incorrect",
+    "fact check", "fact-check", "corrects", "correction",
+    "refutes", "refuted", "disputed", "wrong", "inaccurate",
+    "no proof", "unproven", "baseless", "unfounded",
+]
+
+# F-04: Keywords that confirm a claim is being SUPPORTED
+_SUPPORT_SIGNALS = [
+    "confirms", "confirmed", "verifies", "verified",
+    "study finds", "research shows", "scientists say",
+    "officially", "according to", "data shows",
+]
+
 
 # =============================================================================
 # POST /verify/
@@ -76,21 +105,20 @@ _TIER1_DOMAINS = {
     "/",
     response_model=VerifyResponse,
     status_code=status.HTTP_200_OK,
-    summary="Verify content credibility (semantic similarity search enabled)",
+    summary="Verify content credibility",
 )
 async def verify(
     payload:      VerifyRequest,
     request:      Request,
     current_user: dict = Depends(get_current_user),
+    # F-08 FIX: rate limiting now flows through require_quota → usage_limits table
+    _rate_check:  None = Depends(require_quota),
 ):
     """
     Run a credibility verification on submitted content.
 
-    Semantic similarity search matches claims that mean the same thing
-    even when the wording differs, giving instant cached results.
-
     Authentication: Required (Supabase JWT in Authorization header)
-    Rate limit:     10 verifications per day for free users
+    Rate limit:     Enforced via require_quota dependency (usage_limits table)
     """
 
     # ── STEP 1: Identify user from JWT ────────────────────────────────────────
@@ -102,34 +130,6 @@ async def verify(
         f"claims={len(payload.claims)} type={payload.content_type}"
     )
 
-    # ── STEP 2: Enforce daily limit ───────────────────────────────────────────
-    daily_limit  = settings.DAILY_LIMIT_FREE
-    usage_result = usage_tracker.check_and_increment(
-        user_id     = user_id,
-        daily_limit = daily_limit,
-    )
-
-    if not usage_result["allowed"]:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail={
-                "error":        "Daily verification limit reached",
-                "search_count": usage_result["search_count"],
-                "daily_limit":  daily_limit,
-                "resets_at":    usage_result["resets_at"],
-                "message": (
-                    f"You have used all {daily_limit} of your free daily "
-                    f"verifications. Your limit resets at midnight UTC."
-                ),
-            },
-            headers={
-                "X-RateLimit-Limit":     str(daily_limit),
-                "X-RateLimit-Remaining": "0",
-                "X-RateLimit-Reset":     usage_result["resets_at"],
-                "Retry-After":           str(_seconds_until_midnight()),
-            },
-        )
-
     valid_claims = [c for c in payload.claims if c.text.strip()]
     if not valid_claims:
         raise HTTPException(
@@ -137,12 +137,11 @@ async def verify(
             detail="All claim texts were empty after trimming whitespace.",
         )
 
-    # ── STEP 3: Per-claim cache lookup (exact + semantic) ─────────────────────
+    # ── STEP 2: Per-claim cache lookup (exact + semantic) ─────────────────────
     cached_results:      dict[str, CachedClaimResult] = {}
     claims_to_search:    list[str]                     = []
     semantic_match_info: list[dict]                    = []
 
-    # Run all cache lookups concurrently — each claim is independent
     lookup_results = await asyncio.gather(*[
         claim_cache.lookup(c.text.strip()) for c in valid_claims
     ])
@@ -170,7 +169,7 @@ async def verify(
         f"{semantic_hit_count} semantic | {cache_miss_count} miss"
     )
 
-    # ── STEP 4a: Live news search for cache misses ────────────────────────────
+    # ── STEP 3: Live news search for cache misses ─────────────────────────────
     fresh_news_results: dict[str, dict] = {}
 
     if claims_to_search:
@@ -185,13 +184,13 @@ async def verify(
                 detail="News search is temporarily unavailable. Please try again shortly.",
             )
 
-    # ── STEP 4b: Evaluate fresh claims + store with embeddings ────────────────
+    # ── STEP 4: Evaluate fresh claims + store with embeddings ─────────────────
     store_tasks = []
 
     for claim_text, news in fresh_news_results.items():
+        # F-04 FIX: _evaluate_claim now does headline contradiction detection
         verdict = _evaluate_claim(claim_text, news)
 
-        # Wrap in CachedClaimResult so STEP 5 can treat all claims uniformly
         cached_results[claim_text] = CachedClaimResult(
             status               = verdict["status"],
             confidence           = verdict["confidence"],
@@ -201,7 +200,6 @@ async def verify(
             credibility_score    = verdict["confidence"],
         )
 
-        # Schedule async store — generates embedding for future semantic hits
         store_tasks.append(
             claim_cache.store(
                 raw_claim_text  = claim_text,
@@ -225,7 +223,6 @@ async def verify(
 
         all_sources.extend(cr.sources_checked)
 
-        # FIX #7: EngineClaimInput has no evidence_summary field — removed it
         engine_claims.append(EngineClaimInput(
             text              = raw_text,
             status            = cr.status,
@@ -233,13 +230,10 @@ async def verify(
             fact_check_status = schema_claim.fact_check_status,
         ))
 
-    # Compute credible source count for the scoring engine
-    # FIX #6: ScoringInput has no sources_checked field; use credible_source_count/total_source_count
-    unique_sources    = list(set(all_sources))
-    credible_count    = sum(1 for s in unique_sources if any(d in s for d in _TIER1_DOMAINS))
+    unique_sources     = list(set(all_sources))
+    credible_count     = sum(1 for s in unique_sources if any(d in s for d in _TIER1_DOMAINS))
     total_source_count = len(unique_sources)
 
-    # Collect fact-check statuses for FactCheckJudge
     fact_check_matches = [
         c.fact_check_status
         for c in valid_claims
@@ -249,15 +243,14 @@ async def verify(
     scoring_input = ScoringInput(
         original_content      = payload.original_content,
         claims                = engine_claims,
-        credible_source_count = credible_count,        # FIX #6
-        total_source_count    = total_source_count,    # FIX #6
+        credible_source_count = credible_count,
+        total_source_count    = total_source_count,
         fact_check_matches    = fact_check_matches,
         content_type          = payload.content_type or "tweet",
     )
     content_result = compute_score(scoring_input)
 
     # ── STEP 6: Account credibility ───────────────────────────────────────────
-    # FIX #1: AccountInput uses source_url, username, etc. — not original_content/claims
     meta = payload.account_metadata
     acct_input = AccountInput(
         source_url           = payload.source_url,
@@ -274,24 +267,18 @@ async def verify(
         content_type         = payload.content_type,
     )
     account_result = analyse_account(acct_input)
+    acct_score     = account_result.account_credibility_score
 
-    # FIX #4: use account_credibility_score, not overall_score
-    acct_score = account_result.account_credibility_score
-
-    # FIX #2: blend_scores returns a single float, not a tuple
-    # FIX #3: content_result.credibility_score, not final_score
-    # FIX #2b: param is weight=, not account_weight=
     final_score = blend_scores(
         content_score = content_result.credibility_score,
         account_score = acct_score,
         weight        = settings.ACCOUNT_CREDIBILITY_WEIGHT,
     )
 
-    # ── STEP 7: Save to user history ──────────────────────────────────────────
-    elapsed_ms    = int((time.time() - start_time) * 1000)
+    # ── STEP 7: Build claim results ───────────────────────────────────────────
+    elapsed_ms                      = int((time.time() - start_time) * 1000)
     verdict_code, verdict_label, verdict_color = _score_to_verdict(final_score)
 
-    # Build claim results for the response
     claim_results: list[ClaimResult] = []
     for schema_claim in valid_claims:
         raw_text = schema_claim.text.strip()
@@ -310,47 +297,6 @@ async def verify(
             matched_claim_text  = cr.matched_claim_text if cr.semantic_match else None,
         ))
 
-    history_entry = verification_history.save(
-        user_id                   = user_id,
-        input_text                = payload.original_content,
-        claims                    = [c.model_dump() for c in payload.claims],
-        credibility_score         = final_score,
-        account_credibility_score = acct_score,
-        result_json               = {
-            "verdict":         verdict_code,
-            "cache_hits":      cache_hit_count,
-            "semantic_hits":   semantic_hit_count,
-            "elapsed_ms":      elapsed_ms,
-        },
-    )
-
-    logger.info(
-        f"[/verify] DONE user={user_id[:8]}... "
-        f"score={final_score:.1f} verdict={verdict_code} "
-        f"elapsed={elapsed_ms}ms hits={cache_hit_count} misses={cache_miss_count}"
-    )
-
-    # ── STEP 8: Build response ────────────────────────────────────────────────
-    # FIX #5:  AccountCredibilityResult is a dataclass — no .model_dump()
-    #          Build AccountCredibilityDetail by explicit field mapping
-    account_credibility = AccountCredibilityDetail(
-        account_credibility_score = account_result.account_credibility_score,
-        flags                     = account_result.flags,
-        flag_details              = [
-            FlagDetail(**fd) for fd in account_result.flag_details
-        ],
-        domain_tier      = account_result.domain_tier,
-        source_type      = account_result.source_type,
-        analysis_note    = account_result.analysis_note,
-        data_completeness= account_result.data_completeness,
-    )
-
-    # FIX #8:  SubScore is a dataclass — use dataclasses.asdict() to convert
-    sub_scores = [
-        SubScoreDetail(**dataclasses.asdict(s))
-        for s in content_result.sub_scores
-    ]
-
     claims_breakdown = {
         "total":      len(claim_results),
         "verified":   sum(1 for c in claim_results if c.status == "VERIFIED"),
@@ -359,54 +305,130 @@ async def verify(
         "unverified": sum(1 for c in claim_results if c.status == "UNVERIFIED"),
     }
 
+    # ── STEP 8: Save to verification history ──────────────────────────────────
+    # F-03 FIX: use verifications_db.save() which writes all NOT NULL columns.
+    # The old verification_history.save() only wrote 7 fields and caused
+    # a Postgres NOT NULL violation on verdict/verdict_label/etc every time.
+    try:
+        history_entry = verifications_db.save(
+            user_id            = user_id,
+            input_text         = payload.original_content,
+            claims             = [c.model_dump() for c in payload.claims],
+            claims_total       = claims_breakdown["total"],
+            claims_verified    = claims_breakdown["verified"],
+            claims_false       = claims_breakdown["false"],
+            claims_disputed    = claims_breakdown["disputed"],
+            claims_unverified  = claims_breakdown["unverified"],
+            credibility_score  = final_score,
+            verdict            = verdict_code,
+            verdict_label      = verdict_label,
+            verdict_color      = verdict_color,
+            summary            = content_result.summary,
+            flags              = content_result.flags,
+            confidence_level   = content_result.confidence_level,
+            result_json        = {
+                "verdict":       verdict_code,
+                "cache_hits":    cache_hit_count,
+                "semantic_hits": semantic_hit_count,
+                "elapsed_ms":    elapsed_ms,
+            },
+            sources_consulted  = unique_sources,
+            source_url         = payload.source_url,
+            content_type       = payload.content_type or "tweet",
+            processing_time_ms = elapsed_ms,
+        )
+    except Exception as exc:
+        # Log the failure but don't block the response — the user should
+        # still get their result even if the history save fails.
+        logger.error(f"[/verify] History save failed: {exc}", exc_info=True)
+        history_entry = {}
+
+    logger.info(
+        f"[/verify] DONE user={user_id[:8]}... "
+        f"score={final_score:.1f} verdict={verdict_code} "
+        f"elapsed={elapsed_ms}ms hits={cache_hit_count} misses={cache_miss_count}"
+    )
+
+    # ── STEP 9: Build and return response ────────────────────────────────────
+    account_credibility = AccountCredibilityDetail(
+        account_credibility_score = account_result.account_credibility_score,
+        flags                     = account_result.flags,
+        flag_details              = [
+            FlagDetail(**fd) for fd in account_result.flag_details
+        ],
+        domain_tier       = account_result.domain_tier,
+        source_type       = account_result.source_type,
+        analysis_note     = account_result.analysis_note,
+        data_completeness = account_result.data_completeness,
+    )
+
+    sub_scores = [
+        SubScoreDetail(**dataclasses.asdict(s))
+        for s in content_result.sub_scores
+    ]
+
+    # Get current usage for the response (read-only, does not increment)
+    usage_status = usage_tracker.get_status(user_id, settings.DAILY_LIMIT_FREE)
+
     return VerifyResponse(
         verification_id   = str(history_entry.get("id", "")),
         credibility_score = round(final_score, 2),
         verdict           = verdict_code,
         verdict_label     = verdict_label,
         verdict_color     = verdict_color,
-        # FIX #12: use content_result.confidence_level (str), not content_result.confidence (float)
         confidence_level  = content_result.confidence_level,
         flags             = content_result.flags,
         flag_details      = [FlagDetail(**f) for f in content_result.flag_details],
         summary           = content_result.summary,
-        # FIX #11: added required penalty_total field
         penalty_total     = content_result.penalty_total,
-        # FIX #10: renamed sources_checked → sources_consulted
         sources_consulted = unique_sources,
-        # FIX #9: renamed claims → claim_results
         claim_results     = claim_results,
         claims_breakdown  = claims_breakdown,
-        # FIX #8: sub_scores now properly converted from dataclasses
         sub_scores        = sub_scores,
         account_credibility = account_credibility,
         cache_info = {
-            "hits":             cache_hit_count,
-            "misses":           cache_miss_count,
-            "total_claims":     len(valid_claims),
+            "hits":              cache_hit_count,
+            "misses":            cache_miss_count,
+            "total_claims":      len(valid_claims),
             "served_from_cache": cache_hit_count > 0,
-            "exact_hits":       exact_hit_count,
-            "semantic_hits":    semantic_hit_count,
-            "semantic_matches": semantic_match_info,
+            "exact_hits":        exact_hit_count,
+            "semantic_hits":     semantic_hit_count,
+            "semantic_matches":  semantic_match_info,
         },
         usage = {
-            "search_count": usage_result["search_count"],
-            "daily_limit":  daily_limit,
-            "remaining":    max(0, daily_limit - usage_result["search_count"]),
-            "resets_at":    usage_result["resets_at"],
+            "search_count": usage_status["search_count"],
+            "daily_limit":  usage_status["daily_limit"],
+            "remaining":    usage_status["remaining"],
+            "resets_at":    usage_status["resets_at"],
         },
         elapsed_ms = elapsed_ms,
-        # FIX #11: added required created_at field
         created_at = datetime.now(timezone.utc).isoformat(),
     )
 
 
 # =============================================================================
-# HELPER FUNCTIONS
+# HELPER: _evaluate_claim
+# =============================================================================
+# F-04 FIX: Previous version returned VERIFIED for ANY tier-1 hit regardless
+# of what the article said. A BBC article debunking "vaccines cause autism"
+# would trigger tier1_hit=True → status="VERIFIED" → inflated score.
+#
+# New logic:
+#   1. Scan every article title for contradiction signals (debunked, false, myth…)
+#      combined with keywords from the claim text.
+#   2. If contradiction signals found in ≥1 title → DISPUTED (or FALSE if multiple)
+#   3. If no contradiction but tier-1 hit → VERIFIED
+#   4. If no tier-1 hit but articles found → UNVERIFIED
+#   5. No articles → UNVERIFIED
 # =============================================================================
 
 def _evaluate_claim(claim_text: str, news_result: dict) -> dict:
-    """Convert raw news search results into a claim verdict dict."""
+    """
+    Convert raw news search results into a claim verdict.
+
+    Returns a dict with keys: status, confidence, evidence_summary,
+    supporting_articles.
+    """
     articles = news_result.get("articles", [])
 
     if not articles:
@@ -417,18 +439,85 @@ def _evaluate_claim(claim_text: str, news_result: dict) -> dict:
             "supporting_articles": [],
         }
 
-    # Count how many articles support vs contradict
     tier1_hit = news_result.get("tier1_hit", False)
 
-    # Simple heuristic: if tier-1 sources found anything, lean toward VERIFIED
-    # In a production system you'd use NLP here
-    status     = "VERIFIED" if tier1_hit else "UNVERIFIED"
-    confidence = 70.0 if tier1_hit else 45.0
+    # Extract meaningful keywords from the claim (3+ letter words, no stop words)
+    _STOP = {
+        "the", "and", "for", "are", "was", "were", "that", "this",
+        "with", "has", "have", "had", "but", "not", "from", "they",
+        "will", "all", "can", "its", "been", "who", "did", "into",
+    }
+    claim_keywords = [
+        w.lower() for w in claim_text.split()
+        if len(w) >= 4 and w.lower() not in _STOP
+    ]
+
+    contradiction_count = 0
+    supporting_titles   = []
+
+    for article in articles:
+        title = (article.get("title") or "").lower()
+        if not title:
+            continue
+
+        # Check if this title mentions any claim keyword
+        title_mentions_claim = any(kw in title for kw in claim_keywords)
+
+        if title_mentions_claim:
+            # Check if the title contains contradiction signals
+            has_contradiction = any(sig in title for sig in _CONTRADICTION_SIGNALS)
+            if has_contradiction:
+                contradiction_count += 1
+            else:
+                supporting_titles.append(article.get("title", ""))
+        else:
+            # Title doesn't mention the claim — still include in headline list
+            supporting_titles.append(article.get("title", ""))
+
+    total_articles = len(articles)
+
+    # ── Determine verdict from contradiction analysis ─────────────────────────
+    if contradiction_count >= 2:
+        # Multiple headlines directly contradict this claim
+        status     = "FALSE"
+        confidence = 85.0
+        evidence_summary = (
+            f"{contradiction_count} of {total_articles} article(s) directly contradict "
+            f"this claim. Multiple independent sources debunk it."
+        )
+    elif contradiction_count == 1:
+        # One headline contradicts — disputed, not definitively false
+        status     = "DISPUTED"
+        confidence = 65.0
+        evidence_summary = (
+            f"1 of {total_articles} article(s) contradicts this claim. "
+            f"Further verification is recommended."
+        )
+    elif tier1_hit and supporting_titles:
+        # Tier-1 source found, no contradictions — verified
+        status     = "VERIFIED"
+        confidence = 72.0
+        evidence_summary = (
+            f"{total_articles} article(s) found from credible sources. "
+            f"No contradictions detected."
+        )
+    elif total_articles > 0:
+        # Articles found but no tier-1 source and no direct contradiction
+        status     = "UNVERIFIED"
+        confidence = 48.0
+        evidence_summary = (
+            f"{total_articles} article(s) found but none from Tier-1 sources. "
+            f"Cannot independently verify this claim."
+        )
+    else:
+        status     = "UNVERIFIED"
+        confidence = 40.0
+        evidence_summary = "No relevant news articles found for this claim."
 
     return {
         "status":              status,
         "confidence":          confidence,
-        "evidence_summary":    f"{len(articles)} article(s) found.",
+        "evidence_summary":    evidence_summary,
         "supporting_articles": [a.get("title", "") for a in articles[:5]],
     }
 
