@@ -1,42 +1,44 @@
 # =============================================================================
-# app/middleware/auth.py — Local JWT verification (no network calls)
+# app/middleware/auth.py — Supabase token verification via admin client
 # =============================================================================
 #
-# Verifies the Supabase JWT locally using SUPABASE_JWT_SECRET.
-# Zero network dependency — token validation takes ~0.5ms regardless of
-# Supabase latency or availability.
+# WHY THIS APPROACH:
 #
-# COMMON DEPLOYMENT ISSUES AND HOW THIS FILE HANDLES THEM:
+#   The local JWT verification approach (PyJWT with HS256) stopped working
+#   because Supabase migrated this project to new JWT Signing Keys (RS256
+#   asymmetric signing). New tokens are signed with a private key — the
+#   legacy HS256 secret can no longer verify them.
 #
-#   Issue 1 — Wrong JWT Secret value in Railway env vars
-#     Symptom: DecodeError / "Invalid signature" in logs
-#     Cause:   SUPABASE_JWT_SECRET was set to the Anon Key or Service Role Key
-#              instead of the actual JWT Secret.
-#     Fix:     Supabase Dashboard → Settings → API → "JWT Secret" (not the keys)
+#   This version uses the Supabase admin client that is already initialised
+#   as a singleton in database.py. It calls get_user(token) which works
+#   regardless of whether Supabase uses HS256 or RS256 — Supabase handles
+#   the verification internally on their side.
 #
-#   Issue 2 — Audience validation failure
-#     Symptom: InvalidAudienceError in logs
-#     Cause:   PyJWT's audience check is strict. Supabase tokens carry
-#              aud="authenticated" but some PyJWT versions handle string vs
-#              list audiences differently.
-#     Fix:     This file disables audience verification in PyJWT and instead
-#              checks the "role" claim manually, which is more reliable and
-#              gives a clearer error message.
+# WHY THIS IS SAFE AND PERFORMANT:
 #
-#   Issue 3 — JWT Secret has extra whitespace in env var
-#     Symptom: DecodeError / "Invalid signature" despite seemingly correct value
-#     Cause:   Copy-paste added a leading/trailing space or newline.
-#     Fix:     This file strips whitespace from the secret before use.
+#   The original auth.py (before our changes) created a brand new httpx
+#   client on every single request — a full TCP + TLS handshake each time.
+#   Under load this caused connection exhaustion and timeout-based 401s.
+#
+#   This version reuses the singleton admin client from database.py which
+#   has persistent connection pooling built in. One connection is established
+#   at startup and reused for all requests — no per-request TCP handshake.
+#
+#   The tradeoff vs local JWT verification:
+#     Local JWT:  ~0.5ms, zero network, but broken with RS256 migration
+#     This file:  ~20-50ms, one Supabase call, works with all signing methods
+#
+#   20-50ms is acceptable — the connection is persistent so there is no
+#   TCP/TLS overhead on each request.
 #
 # =============================================================================
 
-import jwt
 import logging
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from app.config import settings
+from app.services.database import get_admin
 
 logger = logging.getLogger(__name__)
 
@@ -47,109 +49,74 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> dict:
     """
-    Verify the Supabase JWT token and return the decoded payload.
+    Verify the Supabase JWT token and return the user object.
 
-    The payload contains: sub (user UUID), email, role, exp, iat, and
-    any other claims Supabase includes (e.g. user_metadata, app_metadata).
+    Uses the singleton Supabase admin client from database.py.
+    Reuses the persistent connection — no new TCP handshake per request.
 
-    Raises HTTP 401 for any invalid, expired, or malformed token.
+    Returns a dict with at minimum: id (user UUID), email, role.
+    The 'sub' key is added as an alias for 'id' so that downstream
+    code using either current_user["sub"] or current_user["id"] works.
+
+    Raises HTTP 401 for any invalid, expired, or unrecognised token.
     """
     token = credentials.credentials
 
-    # Strip whitespace from the secret — guards against copy-paste issues
-    # in Railway/Render environment variable editors.
-    jwt_secret = settings.SUPABASE_JWT_SECRET.strip()
-
-    if not jwt_secret:
-        # Secret is completely missing — log clearly and fail.
-        # This is a configuration error, not a user error.
-        logger.error(
-            "[auth] SUPABASE_JWT_SECRET is empty. "
-            "Set it in Railway environment variables: "
-            "Supabase Dashboard → Settings → API → JWT Secret"
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Server authentication is misconfigured. Please contact support.",
-        )
-
     try:
-        # Decode and verify the JWT locally.
-        #
-        # options={"verify_aud": False}:
-        #   We skip PyJWT's built-in audience check because it is fragile —
-        #   it raises InvalidAudienceError if aud is a list instead of a
-        #   string, which varies by PyJWT version. We verify the role claim
-        #   manually below, which gives the same security guarantee with a
-        #   clearer error message.
-        payload = jwt.decode(
-            token,
-            jwt_secret,
-            algorithms=["HS256"],
-            options={"verify_aud": False},
-        )
+        db = get_admin()
+        response = db.auth.get_user(token)
 
-    except jwt.ExpiredSignatureError:
-        # Token is valid but has passed its expiry time (exp claim).
-        # This is a normal, expected error — user needs to log in again.
-        logger.info("[auth] Token rejected: expired")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session expired. Please log in again.",
-        )
+        if response is None or response.user is None:
+            logger.warning("[auth] Token rejected: get_user returned no user")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired session. Please log in again.",
+            )
 
-    except jwt.DecodeError as e:
-        # Signature verification failed — the secret is wrong, or the token
-        # was tampered with, or there is a whitespace/encoding issue in the secret.
-        logger.warning(
-            f"[auth] Token rejected: DecodeError — {e}. "
-            f"Check that SUPABASE_JWT_SECRET in Railway matches: "
-            f"Supabase Dashboard → Settings → API → JWT Secret"
-        )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid session token.",
-        )
+        user = response.user
 
-    except jwt.InvalidTokenError as e:
-        # Catch-all for any other JWT problem (missing claims, wrong algorithm, etc.)
-        logger.warning(f"[auth] Token rejected: InvalidTokenError — {e}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid session token.",
-        )
+        # Build a clean dict that the rest of the codebase can use.
+        # We expose both "id" and "sub" pointing to the same UUID so that
+        # verify.py's current_user.get("sub") or current_user.get("id")
+        # works correctly regardless of which key callers use.
+        user_dict = {
+            "id":            user.id,
+            "sub":           user.id,   # alias — same value as "id"
+            "email":         user.email,
+            "role":          "authenticated",
+            "phone":         getattr(user, "phone", None),
+            "user_metadata": getattr(user, "user_metadata", {}),
+            "app_metadata":  getattr(user, "app_metadata", {}),
+        }
 
-    # ── Manual role check (replaces PyJWT audience verification) ─────────────
-    #
-    # Every Supabase JWT for a logged-in user has role="authenticated".
-    # Tokens generated for anonymous/service access have different roles.
-    # This check ensures we only accept tokens from real logged-in users.
-    role = payload.get("role")
-    if role != "authenticated":
-        logger.warning(
-            f"[auth] Token rejected: unexpected role='{role}'. "
-            f"Expected 'authenticated'. This token may be a service key, "
-            f"anon key, or a token from a different Supabase project."
-        )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid session token.",
-        )
+        logger.debug(f"[auth] Token verified for user={user.id[:8]}...")
+        return user_dict
 
-    # ── Ensure user_id is present ─────────────────────────────────────────────
-    user_id = payload.get("sub")
-    if not user_id:
+    except HTTPException:
+        raise   # re-raise our own 401s as-is
+
+    except Exception as e:
+        error_str = str(e).lower()
+
+        # Supabase returns specific error messages we can map to clear responses
+        if "invalid" in error_str or "expired" in error_str or "jwt" in error_str:
+            logger.warning(f"[auth] Token rejected: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired session. Please log in again.",
+            )
+
+        # Supabase itself is unreachable (network error, timeout, etc.)
+        # Log it clearly so you can see it in Railway logs.
         logger.error(
-            f"[auth] Token decoded successfully but 'sub' claim is missing. "
-            f"Claims present: {list(payload.keys())}"
+            f"[auth] Supabase auth check failed — this is a connectivity "
+            f"issue between Railway and Supabase, not a user error: {e}",
+            exc_info=True,
         )
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token missing user ID.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication service temporarily unavailable. Please try again.",
         )
-
-    logger.debug(f"[auth] Token verified for user={user_id[:8]}...")
-    return payload
 
 
 async def get_verified_user_id(
