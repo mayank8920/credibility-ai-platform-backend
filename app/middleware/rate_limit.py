@@ -56,7 +56,7 @@ async def require_quota(
     Raises HTTP 429 if the daily limit is reached.
     Returns None if the request is allowed (dependency returns nothing on success).
     """
-    user_id = current_user.get("sub")
+    user_id = current_user.get("sub") or current_user.get("id")
     if not user_id:
         # This shouldn't happen if get_current_user succeeded, but be safe
         raise HTTPException(
