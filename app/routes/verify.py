@@ -35,6 +35,7 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Depends, Request, status
+from fastapi.concurrency import run_in_threadpool
 
 from app.models.schemas import (
     VerifyRequest, VerifyResponse,
@@ -122,7 +123,9 @@ async def verify(
     """
 
     # ── STEP 1: Identify user from JWT ────────────────────────────────────────
-    user_id    = current_user["sub"]
+    user_id    = current_user.get("id") or current_user.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Could not identify user.")
     start_time = time.time()
 
     logger.info(
@@ -310,7 +313,7 @@ async def verify(
     # The old verification_history.save() only wrote 7 fields and caused
     # a Postgres NOT NULL violation on verdict/verdict_label/etc every time.
     try:
-        history_entry = verifications_db.save(
+        history_entry = await run_in_threadpool(lambda: verifications_db.save(
             user_id            = user_id,
             input_text         = payload.original_content,
             claims             = [c.model_dump() for c in payload.claims],
@@ -336,7 +339,7 @@ async def verify(
             source_url         = payload.source_url,
             content_type       = payload.content_type or "tweet",
             processing_time_ms = elapsed_ms,
-        )
+        ))
     except Exception as exc:
         # Log the failure but don't block the response — the user should
         # still get their result even if the history save fails.
@@ -368,7 +371,7 @@ async def verify(
     ]
 
     # Get current usage for the response (read-only, does not increment)
-    usage_status = usage_tracker.get_status(user_id, settings.DAILY_LIMIT_FREE)
+    usage_status = await run_in_threadpool(usage_db.get_status, user_id)
 
     return VerifyResponse(
         verification_id   = str(history_entry.get("id", "")),
