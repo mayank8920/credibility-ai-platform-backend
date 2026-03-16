@@ -25,28 +25,7 @@
 #              Added _rate_check: None = Depends(require_quota) dependency
 #              which consolidates rate limiting through rate_limit.py →
 #              usage_limits table → get_usage_status() RPC.
-#
-#   F-09  usage_tracker.get_status() (usage_tracking table / search_count)
-#         was used to build the usage object in the response, while
-#         require_quota reads from usage_db (usage_limits table /
-#         requests_count). These are two separate counters in two separate
-#         tables — they diverge over time, so the usage bar in the frontend
-#         showed a different number than the quota enforcer was using.
-#         FIX: removed usage_tracker import entirely. The response usage
-#              object is now built from usage_db.get_status() — the same
-#              source that require_quota uses — so the UI and the enforcer
-#              always agree on the same number.
-#              Key mapping updated: usage_db returns {"used", "limit",
-#              "remaining", "reset_at"} while the frontend expects
-#              {"search_count", "daily_limit", "remaining", "resets_at"}.
-#              The response dict now maps these correctly.
-#
-#   F-10  current_user["sub"] raised KeyError when the backend used the old
-#         HTTP-call auth middleware (which returned Supabase's /auth/v1/user
-#         response containing "id", not "sub"). The new local JWT middleware
-#         (auth.py fix) always returns a JWT payload which always has "sub",
-#         but for safety the extraction now falls back to "id" so the route
-#         works correctly regardless of which middleware version is deployed.
+#              usage_tracker is still imported for the /usage/today response.
 # =============================================================================
 
 import dataclasses
@@ -76,10 +55,9 @@ from app.services.account_credibility import (
 from app.services.news_service import search_multiple_claims
 
 # F-03 FIX: import verifications_db from database.py (has all required columns)
-# F-09 FIX: import usage_db (usage_limits table) as the single source of truth
-#           for usage — replaces usage_tracker (usage_tracking table) which was
-#           a second diverging counter. usage_tracker import removed entirely.
-from app.services.database import verifications_db, usage_db
+# Remove: from app.services.usage_service import usage_tracker, verification_history
+from app.services.database import verifications_db
+from app.services.usage_service import usage_tracker   # kept for usage info in response
 
 from app.services.claim_cache import claim_cache, CachedClaimResult
 from app.middleware.auth import get_current_user
@@ -144,28 +122,7 @@ async def verify(
     """
 
     # ── STEP 1: Identify user from JWT ────────────────────────────────────────
-    #
-    # F-10 FIX: The new local JWT middleware (auth.py) returns a decoded JWT
-    # payload, which always has a "sub" field containing the user's UUID.
-    # The old HTTP-call middleware returned Supabase's /auth/v1/user response,
-    # which uses "id" instead of "sub". The fallback to "id" ensures this route
-    # works correctly regardless of which middleware version is currently deployed,
-    # and makes future middleware swaps safe with no changes needed here.
-    user_id = current_user.get("sub") or current_user.get("id")
-
-    if not user_id:
-        # Neither "sub" nor "id" present — the token is malformed or the
-        # middleware returned an unexpected structure. Fail with a clear error
-        # rather than crashing with a KeyError or operating with a None user_id.
-        logger.error(
-            f"[/verify] Could not extract user_id from current_user dict. "
-            f"Keys present: {list(current_user.keys())}"
-        )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not determine user identity from token. Please log in again.",
-        )
-
+    user_id    = current_user["sub"]
     start_time = time.time()
 
     logger.info(
@@ -410,19 +367,8 @@ async def verify(
         for s in content_result.sub_scores
     ]
 
-    # F-09 FIX: use usage_db.get_status() — the same source require_quota uses
-    # — so the usage bar in the UI always agrees with the quota enforcer.
-    # Previously this called usage_tracker.get_status() which read from the
-    # usage_tracking table, while require_quota read from usage_limits. Two
-    # separate counters meant the UI could show 3/10 while the enforcer had
-    # already counted 7/10 — users would hit the limit unexpectedly.
-    #
-    # usage_db.get_status() returns:
-    #   {"used", "limit", "remaining", "allowed", "plan", "reset_at"}
-    # The frontend expects:
-    #   {"search_count", "daily_limit", "remaining", "resets_at"}
-    # The mapping below bridges the key name difference.
-    usage_status = usage_db.get_status(user_id)
+    # Get current usage for the response (read-only, does not increment)
+    usage_status = usage_tracker.get_status(user_id, settings.DAILY_LIMIT_FREE)
 
     return VerifyResponse(
         verification_id   = str(history_entry.get("id", "")),
@@ -449,12 +395,11 @@ async def verify(
             "semantic_hits":     semantic_hit_count,
             "semantic_matches":  semantic_match_info,
         },
-        # F-09 FIX: key names mapped from usage_db response → frontend expectation
         usage = {
-            "search_count": usage_status.get("used",      0),
-            "daily_limit":  usage_status.get("limit",     settings.DAILY_LIMIT_FREE),
-            "remaining":    usage_status.get("remaining", 0),
-            "resets_at":    usage_status.get("reset_at",  ""),
+            "search_count": usage_status["search_count"],
+            "daily_limit":  usage_status["daily_limit"],
+            "remaining":    usage_status["remaining"],
+            "resets_at":    usage_status["resets_at"],
         },
         elapsed_ms = elapsed_ms,
         created_at = datetime.now(timezone.utc).isoformat(),
