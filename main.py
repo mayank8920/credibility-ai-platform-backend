@@ -3,16 +3,14 @@
 # Run locally with: uvicorn main:app --reload --port 8000
 # =============================================================================
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.exceptions import ResponseValidationError
 from contextlib import asynccontextmanager
 import logging
-import traceback
 
 from app.routes import auth, verify, history, user, usage
-from app.routes import claims
+from app.routes import claims          # ← NEW: global claim cache admin routes
 from app.config import settings
 
 logging.basicConfig(
@@ -67,7 +65,7 @@ app.include_router(verify.router,  prefix="/verify",  tags=["🔍 Verification"]
 app.include_router(history.router, prefix="/history", tags=["📋 History"])
 app.include_router(user.router,    prefix="/user",    tags=["👤 User"])
 app.include_router(usage.router,   prefix="/usage",   tags=["📊 Usage Tracking"])
-app.include_router(claims.router,  prefix="/claims",  tags=["🗄️ Global Claims"])
+app.include_router(claims.router,  prefix="/claims",  tags=["🗄️ Global Claims"])  # ← NEW
 
 
 @app.get("/", tags=["Health"])
@@ -76,7 +74,13 @@ async def root():
         "status":  "ok",
         "service": "Credibility Verification Platform",
         "version": "2.0.0",
-        "docs":    "/docs",
+        "features": [
+            "global_claim_cache",
+            "daily_usage_limits",
+            "account_credibility",
+            "five_judge_scoring",
+        ],
+        "docs": "/docs",
     }
 
 
@@ -85,54 +89,9 @@ async def health():
     return {"status": "healthy"}
 
 
-# =============================================================================
-# EXCEPTION HANDLERS
-# =============================================================================
-#
-# IMPORTANT: FastAPI 0.100+ has a separate internal exception type called
-# ResponseValidationError that fires when Pydantic fails to serialize the
-# RESPONSE (not the request). This bypasses the generic Exception handler
-# below AND bypasses CORSMiddleware — causing 500s with no CORS headers
-# and no log output.
-#
-# We must register a handler for it explicitly so that:
-#   1. The actual error is logged to Railway
-#   2. The response goes through CORSMiddleware (CORS headers are added)
-#
-# =============================================================================
-
-@app.exception_handler(ResponseValidationError)
-async def response_validation_error_handler(request: Request, exc: ResponseValidationError):
-    """
-    Catches Pydantic response serialization failures.
-    These happen when a route returns data that doesn't match its response model.
-    Without this handler, FastAPI returns 500 with no CORS headers and no logs.
-    """
-    logger.error(
-        f"[ResponseValidationError] Route: {request.method} {request.url.path}\n"
-        f"Error: {exc}\n"
-        f"{traceback.format_exc()}"
-    )
-    return JSONResponse(
-        status_code=500,
-        content={
-            "detail": "Response serialization failed. Check Railway logs for details.",
-            "path": str(request.url.path),
-        },
-    )
-
-
 @app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    """
-    Catches all other unhandled exceptions.
-    Logs the full traceback so Railway logs show the exact error.
-    """
-    logger.error(
-        f"[UnhandledException] Route: {request.method} {request.url.path}\n"
-        f"Error: {type(exc).__name__}: {exc}\n"
-        f"{traceback.format_exc()}"
-    )
+async def global_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
         content={"detail": "An internal server error occurred. Please try again."},
