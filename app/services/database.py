@@ -220,16 +220,16 @@ class VerificationService:
         for row in (response.data or []):
             items.append({
                 "verification_id":   row["id"],
-                "credibility_score": row["credibility_score"],
-                "verdict":           row["verdict"],
-                "verdict_label":     row["verdict_label"],
-                "verdict_color":     row["verdict_color"],
-                "content_type":      row["content_type"],
-                "content_preview":   row.get("input_preview", "")[:120],
-                "claims_total":      row["claims_total"],
-                "claims_verified":   row["claims_verified"],
-                "flags":             row.get("flags", []),
-                "created_at":        row["timestamp"],
+                "credibility_score": row.get("credibility_score") or 0.0,
+                "verdict":           row.get("verdict") or "UNVERIFIED",
+                "verdict_label":     row.get("verdict_label") or "Unverified",
+                "verdict_color":     row.get("verdict_color") or "#6b7280",
+                "content_type":      row.get("content_type") or "tweet",
+                "content_preview":   (row.get("input_preview") or "")[:120],
+                "claims_total":      row.get("claims_total") or 0,
+                "claims_verified":   row.get("claims_verified") or 0,
+                "flags":             row.get("flags") or [],
+                "created_at":        row.get("timestamp") or "",
             })
 
         return {
